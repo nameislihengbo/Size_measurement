@@ -5,12 +5,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import os
 
-class ImprovedLabelExtractor:
+class FixedRatioLabelExtractor:
     def __init__(self, root):
         self.root = root
-        self.root.title("优化预览的标签提取工具")
+        self.root.title("固定界面比例的标签提取工具")
         self.root.geometry("1200x750")
-        self.root.minsize(800, 600)
+        self.root.minsize(1000, 600)
         
         # 配置变量
         self.input_path = tk.StringVar()
@@ -21,6 +21,8 @@ class ImprovedLabelExtractor:
         self.edge_threshold2 = tk.IntVar(value=150)
         self.min_contour_area = tk.IntVar(value=500)
         self.preview_mode = tk.StringVar(value="original")  # original, detected, edges
+        # 新增：自动检测范围调整参数
+        self.auto_expand_ratio = tk.DoubleVar(value=1.0)  # 自动检测范围扩大比例
         
         # 图像相关变量
         self.original_img = None  # 原始图像
@@ -34,6 +36,7 @@ class ImprovedLabelExtractor:
         self.last_x = 0  # 上次鼠标X位置
         self.last_y = 0  # 上次鼠标Y位置
         self.dragging = False  # 是否正在拖动
+        self.preview_updating = False  # 预览更新标志，防止递归更新
         
         # 检测结果变量
         self.detected_contour = None  # 检测到的轮廓
@@ -58,21 +61,26 @@ class ImprovedLabelExtractor:
         self.preview_canvas.bind("<Button-5>", self.on_mouse_wheel)   # Linux
         self.root.bind("<Configure>", self.on_window_resize)  # 窗口大小变化事件
         
-        # 参数变化时自动更新预览
-        self.edge_threshold1.trace_add("write", lambda *args: self.update_preview())
-        self.edge_threshold2.trace_add("write", lambda *args: self.update_preview())
-        self.min_contour_area.trace_add("write", lambda *args: self.update_preview())
+        # 参数变化时自动更新预览，但添加延迟防止频繁更新
+        self.edge_threshold1.trace_add("write", lambda *args: self.schedule_preview_update())
+        self.edge_threshold2.trace_add("write", lambda *args: self.schedule_preview_update())
+        self.min_contour_area.trace_add("write", lambda *args: self.schedule_preview_update())
         self.detection_method.trace_add("write", lambda *args: self.reset_manual_selection())
+        self.border_mm.trace_add("write", lambda *args: self.update_border_label())
+        # 新增：自动扩展比例变化时更新预览
+        self.auto_expand_ratio.trace_add("write", lambda *args: self.schedule_preview_update())
     
     def create_widgets(self):
-        # 主框架
+        # 主框架 - 设置权重以固定比例
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.grid_columnconfigure(0, weight=2)  # 控制面板占2份
+        main_frame.grid_columnconfigure(1, weight=5)  # 预览区域占5份
+        main_frame.grid_rowconfigure(0, weight=1)
         
         # 左侧控制面板
         control_frame = ttk.LabelFrame(main_frame, text="设置", padding="10")
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        control_frame.configure(width=350)
+        control_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         
         # 输入输出设置
         io_frame = ttk.LabelFrame(control_frame, text="文件设置", padding="5")
@@ -98,31 +106,41 @@ class ImprovedLabelExtractor:
         ttk.Radiobutton(method_subframe, text="自动检测", variable=self.detection_method, value="auto").pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(method_subframe, text="手动框选", variable=self.detection_method, value="manual").pack(side=tk.LEFT, padx=5)
         
-        # 边界设置
-        ttk.Label(method_frame, text="边界宽度(mm):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        # 新增：自动检测范围调整 - 改进布局和标签
+        auto_detect_settings_frame = ttk.LabelFrame(control_frame, text="自动检测参数", padding="5")
+        auto_detect_settings_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(auto_detect_settings_frame, text="检测范围扩大比例:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(auto_detect_settings_frame, variable=self.auto_expand_ratio, from_=1.0, to=2.0, orient="horizontal", 
+                 length=150, command=lambda v: self.update_label(self.expand_label, f"{float(v):.2f}x")).grid(row=1, column=0, padx=5, pady=5, sticky="we")
+        self.expand_label = ttk.Label(auto_detect_settings_frame, text=f"{self.auto_expand_ratio.get():.2f}x")
+        self.expand_label.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        
+        # 边界设置 - 显示小数点后三位
+        ttk.Label(method_frame, text="边界宽度(mm):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
         ttk.Scale(method_frame, variable=self.border_mm, from_=0.1, to=5.0, orient="horizontal", 
-                 length=150, command=lambda v: self.update_label(self.border_label, f"{float(v):.1f} mm")).grid(row=1, column=1, padx=5, pady=5, sticky="w")
-        self.border_label = ttk.Label(method_frame, text=f"{self.border_mm.get():.1f} mm")
-        self.border_label.grid(row=1, column=2, padx=5, pady=5, sticky="w")
+                 length=150).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.border_label = ttk.Label(method_frame, text=f"{self.border_mm.get():.3f} mm")
+        self.border_label.grid(row=2, column=2, padx=5, pady=5, sticky="w")
         
         # 边缘检测参数
-        ttk.Label(method_frame, text="边缘阈值1:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(method_frame, text="边缘阈值1:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
         ttk.Scale(method_frame, variable=self.edge_threshold1, from_=10, to=200, orient="horizontal", 
-                 length=150, command=lambda v: self.update_label(self.edge1_label, f"{v}")).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+                 length=150, command=lambda v: self.update_label(self.edge1_label, f"{int(float(v))}")).grid(row=3, column=1, padx=5, pady=5, sticky="w")
         self.edge1_label = ttk.Label(method_frame, text=f"{self.edge_threshold1.get()}")
-        self.edge1_label.grid(row=2, column=2, padx=5, pady=5, sticky="w")
+        self.edge1_label.grid(row=3, column=2, padx=5, pady=5, sticky="w")
         
-        ttk.Label(method_frame, text="边缘阈值2:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(method_frame, text="边缘阈值2:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
         ttk.Scale(method_frame, variable=self.edge_threshold2, from_=100, to=400, orient="horizontal", 
-                 length=150, command=lambda v: self.update_label(self.edge2_label, f"{v}")).grid(row=3, column=1, padx=5, pady=5, sticky="w")
+                 length=150, command=lambda v: self.update_label(self.edge2_label, f"{int(float(v))}")).grid(row=4, column=1, padx=5, pady=5, sticky="w")
         self.edge2_label = ttk.Label(method_frame, text=f"{self.edge_threshold2.get()}")
-        self.edge2_label.grid(row=3, column=2, padx=5, pady=5, sticky="w")
+        self.edge2_label.grid(row=4, column=2, padx=5, pady=5, sticky="w")
         
-        ttk.Label(method_frame, text="最小轮廓面积:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(method_frame, text="最小轮廓面积:").grid(row=5, column=0, padx=5, pady=5, sticky="w")
         ttk.Scale(method_frame, variable=self.min_contour_area, from_=100, to=5000, orient="horizontal", 
-                 length=150, command=lambda v: self.update_label(self.area_label, f"{v}")).grid(row=4, column=1, padx=5, pady=5, sticky="w")
+                 length=150, command=lambda v: self.update_label(self.area_label, f"{int(float(v))}")).grid(row=5, column=1, padx=5, pady=5, sticky="w")
         self.area_label = ttk.Label(method_frame, text=f"{self.min_contour_area.get()}")
-        self.area_label.grid(row=4, column=2, padx=5, pady=5, sticky="w")
+        self.area_label.grid(row=5, column=2, padx=5, pady=5, sticky="w")
         
         method_frame.grid_columnconfigure(1, weight=1)
         
@@ -147,10 +165,10 @@ class ImprovedLabelExtractor:
         
         # 右侧预览区域
         preview_container = ttk.LabelFrame(main_frame, text="预览区域", padding="10")
-        preview_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        preview_container.grid(row=0, column=1, sticky="nsew")
         
-        # 预览画布
-        self.preview_canvas = tk.Canvas(preview_container, bg="#f0f0f0", cursor="cross")
+        # 预览画布 - 设置固定的初始滚动区域以防止跳动
+        self.preview_canvas = tk.Canvas(preview_container, bg="#f0f0f0", cursor="cross", scrollregion=(0, 0, 1000, 1000))
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         
         # 添加滚动条
@@ -170,6 +188,10 @@ class ImprovedLabelExtractor:
     def update_label(self, label, text):
         """更新标签文本"""
         label.config(text=text)
+    
+    def update_border_label(self):
+        """更新边界宽度标签，显示小数点后三位"""
+        self.border_label.config(text=f"{self.border_mm.get():.3f} mm")
     
     def browse_input(self):
         """浏览选择输入图片"""
@@ -207,9 +229,23 @@ class ImprovedLabelExtractor:
             messagebox.showerror("错误", f"加载图片失败: {str(e)}")
             self.status_label.config(text=f"加载图片失败: {str(e)}")
     
+    def schedule_preview_update(self):
+        """延迟调度预览更新，避免参数调整时频繁更新"""
+        if self.original_img is None:
+            return
+            
+        # 取消之前的调度，只执行最后一次
+        try:
+            self.root.after_cancel(self.update_after_id)
+        except:
+            pass
+            
+        # 延迟50毫秒更新，避免滑块拖动时频繁刷新
+        self.update_after_id = self.root.after(50, self.update_preview)
+    
     def fit_to_window(self):
         """调整图像大小以适应窗口"""
-        if self.original_img is None:
+        if self.original_img is None or self.preview_updating:
             return
             
         # 获取画布尺寸
@@ -218,7 +254,7 @@ class ImprovedLabelExtractor:
         
         # 如果画布还没渲染，使用窗口尺寸估算
         if canvas_width < 100 or canvas_height < 100:
-            canvas_width = self.root.winfo_width() - 450  # 减去控制面板宽度和边距
+            canvas_width = int(self.root.winfo_width() * 5 / 7) - 50  # 根据比例计算
             canvas_height = self.root.winfo_height() - 100  # 减去边距和状态栏
         
         # 获取图像尺寸
@@ -236,9 +272,9 @@ class ImprovedLabelExtractor:
         self.update_preview()
     
     def on_window_resize(self, event):
-        """窗口大小变化时自动调整"""
-        # 避免在窗口初始化时触发
-        if self.original_img is not None and event.widget == self.root:
+        """窗口大小变化时自动调整，保持固定比例"""
+        # 避免在窗口初始化时触发，避免预览更新时递归触发
+        if self.original_img is not None and event.widget == self.root and not self.preview_updating:
             # 检查是否是显著的尺寸变化
             if abs(event.width - self.root.winfo_width()) > 50 or abs(event.height - self.root.winfo_height()) > 50:
                 self.fit_to_window()
@@ -253,8 +289,8 @@ class ImprovedLabelExtractor:
             self.update_preview()
     
     def on_canvas_click(self, event):
-        """处理画布点击事件"""
-        if not self.original_img:
+        """处理画布点击事件 - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
             return
             
         if self.detection_method.get() == "manual":
@@ -270,8 +306,8 @@ class ImprovedLabelExtractor:
             self.last_y = event.y
     
     def on_canvas_drag(self, event):
-        """处理画布拖动事件"""
-        if not self.original_img:
+        """处理画布拖动事件 - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
             return
             
         if self.detection_method.get() == "manual" and self.selecting:
@@ -295,8 +331,8 @@ class ImprovedLabelExtractor:
             self.update_preview()
     
     def on_canvas_release(self, event):
-        """处理画布释放事件"""
-        if not self.original_img:
+        """处理画布释放事件 - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
             return
             
         if self.detection_method.get() == "manual" and self.selecting:
@@ -314,8 +350,8 @@ class ImprovedLabelExtractor:
             self.dragging = False
     
     def on_mouse_wheel(self, event):
-        """处理鼠标滚轮事件（缩放）"""
-        if not self.original_img:
+        """处理鼠标滚轮事件（缩放） - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
             return
             
         # 获取鼠标在图像上的位置
@@ -433,6 +469,24 @@ class ImprovedLabelExtractor:
         # 预处理
         preprocessed = self.preprocess_image(img)
         
+        # 应用自动检测范围扩大比例
+        if self.auto_expand_ratio.get() > 1.0:
+            # 创建一个比原图更大的画布来扩展检测区域
+            h, w = preprocessed.shape[:2]
+            new_w = int(w * self.auto_expand_ratio.get())
+            new_h = int(h * self.auto_expand_ratio.get())
+            
+            # 创建扩展后的图像（用黑色填充）
+            expanded = np.zeros((new_h, new_w), dtype=preprocessed.dtype)
+            
+            # 将原图像放置在中心
+            y_offset = (new_h - h) // 2
+            x_offset = (new_w - w) // 2
+            expanded[y_offset:y_offset+h, x_offset:x_offset+w] = preprocessed
+            
+            # 更新处理后的图像
+            preprocessed = expanded
+        
         # 边缘检测
         edges = cv2.Canny(preprocessed, self.edge_threshold1.get(), self.edge_threshold2.get())
         
@@ -444,7 +498,22 @@ class ImprovedLabelExtractor:
         contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # 筛选最佳轮廓
-        best_contour = self.get_best_label_contour(contours, img.shape)
+        best_contour = self.get_best_label_contour(contours, preprocessed.shape)
+        
+        # 如果使用了扩展检测，需要将轮廓坐标转换回原始图像坐标
+        if self.auto_expand_ratio.get() > 1.0 and best_contour is not None:
+            # 计算偏移量
+            h, w = img.shape[:2]
+            y_offset = (preprocessed.shape[0] - h) // 2
+            x_offset = (preprocessed.shape[1] - w) // 2
+            
+            # 调整轮廓坐标
+            best_contour[:, :, 0] = best_contour[:, :, 0] - x_offset
+            best_contour[:, :, 1] = best_contour[:, :, 1] - y_offset
+            
+            # 确保轮廓坐标在有效范围内
+            best_contour[:, :, 0] = np.clip(best_contour[:, :, 0], 0, w-1)
+            best_contour[:, :, 1] = np.clip(best_contour[:, :, 1], 0, h-1)
         
         # 转换边缘图像为RGB用于显示
         edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
@@ -452,64 +521,90 @@ class ImprovedLabelExtractor:
         return best_contour, edges_rgb
     
     def update_preview(self):
-        """更新预览区域显示"""
-        if self.original_img is None:
+        """更新预览区域显示，保持视图稳定"""
+        if self.original_img is None or self.preview_updating:
             return
             
-        # 根据预览模式选择要显示的图像
-        if self.preview_mode.get() == "original":
-            display_img = self.processed_img.copy()
-        elif self.preview_mode.get() == "edges":
-            # 如果还没有计算边缘，先计算
-            if self.edges_img is None:
-                _, self.edges_img = self.detect_label_auto(self.original_img)
-            display_img = self.edges_img.copy() if self.edges_img is not None else self.processed_img.copy()
-        else:  # detected
-            display_img = self.processed_img.copy()
-            # 自动检测模式下绘制检测结果
-            if self.detection_method.get() == "auto":
-                self.detected_contour, self.edges_img = self.detect_label_auto(self.original_img)
-                if self.detected_contour is not None:
-                    # 绘制轮廓
-                    cv2.drawContours(display_img, [self.detected_contour], -1, (0, 255, 0), 2)
-                    # 绘制边界框
-                    x, y, w, h = cv2.boundingRect(self.detected_contour)
+        # 设置更新标志，防止递归更新
+        self.preview_updating = True
+        
+        try:
+            # 保存当前画布尺寸
+            canvas_width = self.preview_canvas.winfo_width()
+            canvas_height = self.preview_canvas.winfo_height()
+            
+            # 根据预览模式选择要显示的图像
+            if self.preview_mode.get() == "original":
+                display_img = self.processed_img.copy()
+            elif self.preview_mode.get() == "edges":
+                # 如果还没有计算边缘，先计算
+                if self.edges_img is None:
+                    _, self.edges_img = self.detect_label_auto(self.original_img)
+                display_img = self.edges_img.copy() if self.edges_img is not None else self.processed_img.copy()
+            else:  # detected
+                display_img = self.processed_img.copy()
+                # 自动检测模式下绘制检测结果
+                if self.detection_method.get() == "auto":
+                    self.detected_contour, self.edges_img = self.detect_label_auto(self.original_img)
+                    if self.detected_contour is not None:
+                        # 绘制轮廓
+                        cv2.drawContours(display_img, [self.detected_contour], -1, (0, 255, 0), 2)
+                        # 绘制边界框
+                        x, y, w, h = cv2.boundingRect(self.detected_contour)
+                        
+                        # 新增：根据auto_expand_ratio调整显示的边界框
+                        if self.auto_expand_ratio.get() > 1.0:
+                            # 计算新的边界框尺寸
+                            center_x = x + w // 2
+                            center_y = y + h // 2
+                            new_w = int(w * self.auto_expand_ratio.get())
+                            new_h = int(h * self.auto_expand_ratio.get())
+                            
+                            # 调整边界框坐标
+                            x = max(0, center_x - new_w // 2)
+                            y = max(0, center_y - new_h // 2)
+                            w = min(display_img.shape[1] - x, new_w)
+                            h = min(display_img.shape[0] - y, new_h)
+                        
+                        cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                        self.detected_rect = (x, y, w, h)
+                    else:
+                        self.detected_rect = None
+                        cv2.putText(display_img, "未检测到标签，请调整参数", (50, 50), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            
+            # 手动模式下绘制选择框
+            if self.detection_method.get() == "manual":
+                if self.temp_rect:
+                    x, y, w, h = self.temp_rect
+                    cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                if self.manual_rect:
+                    x, y, w, h = self.manual_rect
                     cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                    self.detected_rect = (x, y, w, h)
-                else:
-                    self.detected_rect = None
-                    cv2.putText(display_img, "未检测到标签，请调整参数", (50, 50), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-        
-        # 手动模式下绘制选择框
-        if self.detection_method.get() == "manual":
-            if self.temp_rect:
-                x, y, w, h = self.temp_rect
-                cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            if self.manual_rect:
-                x, y, w, h = self.manual_rect
-                cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                cv2.putText(display_img, "标签区域", (x, y - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        
-        # 调整图像大小用于显示
-        h, w = display_img.shape[:2]
-        scaled_h, scaled_w = int(h * self.scale_factor), int(w * self.scale_factor)
-        resized_img = cv2.resize(display_img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-        
-        # 转换为PhotoImage
-        self.photo_img = ImageTk.PhotoImage(image=Image.fromarray(resized_img))
-        
-        # 更新画布
-        self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(self.offset_x, self.offset_y, image=self.photo_img, anchor=tk.NW)
-        
-        # 更新滚动区域（限制最大滚动范围）
-        canvas_width = self.preview_canvas.winfo_width()
-        canvas_height = self.preview_canvas.winfo_height()
-        scroll_width = max(scaled_w + 2*self.offset_x, canvas_width)
-        scroll_height = max(scaled_h + 2*self.offset_y, canvas_height)
-        self.preview_canvas.config(scrollregion=(0, 0, scroll_width, scroll_height))
+                    cv2.putText(display_img, "标签区域", (x, y - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            # 调整图像大小用于显示（保持当前缩放比例）
+            h, w = display_img.shape[:2]
+            scaled_h, scaled_w = int(h * self.scale_factor), int(w * self.scale_factor)
+            resized_img = cv2.resize(display_img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+            
+            # 转换为PhotoImage
+            self.photo_img = ImageTk.PhotoImage(image=Image.fromarray(resized_img))
+            
+            # 更新画布，但保持当前视图位置
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(self.offset_x, self.offset_y, image=self.photo_img, anchor=tk.NW)
+            
+            # 维持滚动区域稳定，只在必要时调整
+            if canvas_width > 0 and canvas_height > 0:
+                scroll_width = max(scaled_w + self.offset_x * 2, canvas_width)
+                scroll_height = max(scaled_h + self.offset_y * 2, canvas_height)
+                self.preview_canvas.config(scrollregion=(0, 0, scroll_width, scroll_height))
+                
+        finally:
+            # 重置更新标志
+            self.preview_updating = False
     
     def process_image(self):
         """处理图像并提取标签"""
@@ -551,7 +646,7 @@ class ImprovedLabelExtractor:
                 # 获取旋转边界框
                 rect = cv2.minAreaRect(self.detected_contour)
                 box = cv2.boxPoints(rect)
-                box = np.int32(box)
+                box = np.intp(box)  # 修改:将np.int32替换为np.intp
                 
                 # 计算边界框的最小和最大坐标
                 x_coords = [point[0] for point in box]
@@ -559,6 +654,22 @@ class ImprovedLabelExtractor:
                 x_min, x_max = min(x_coords), max(x_coords)
                 y_min, y_max = min(y_coords), max(y_coords)
                 
+                # 新增：根据设置扩大检测范围
+                if self.auto_expand_ratio.get() > 1.0:
+                    width = x_max - x_min
+                    height = y_max - y_min
+                    center_x = (x_min + x_max) // 2
+                    center_y = (y_min + y_max) // 2
+                    
+                    # 按比例扩大
+                    new_width = int(width * self.auto_expand_ratio.get())
+                    new_height = int(height * self.auto_expand_ratio.get())
+                    
+                    x_min = max(0, center_x - new_width // 2)
+                    x_max = min(img.shape[1], center_x + new_width // 2)
+                    y_min = max(0, center_y - new_height // 2)
+                    y_max = min(img.shape[0], center_y + new_height // 2)
+            
             else:  # manual
                 if not self.manual_rect:
                     raise ValueError("请先在预览区域框选标签")
@@ -594,6 +705,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     # 设置中文字体支持
     root.option_add("*Font", "SimHei 10")
-    app = ImprovedLabelExtractor(root)
+    app = FixedRatioLabelExtractor(root)
     root.mainloop()
     
