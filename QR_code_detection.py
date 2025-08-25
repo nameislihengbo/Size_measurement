@@ -1,140 +1,923 @@
-import sys
-sys.path.append(r"D:\pip_hub")
-
-from paddleocr import PaddleOCR
-from PIL import Image
 import cv2
 import numpy as np
-import os
-import shutil
+from PIL import Image, ImageTk
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox, ttk
+import os
 
-# 图片文件夹路径
-image_folder = r'C:\Users\LHB\Pictures\OCR_Captures'
-result_folder = r'C:\Users\LHB\Pictures\OCR_Results'
-processed_folder = r'C:\Users\LHB\Pictures\Processed_Images'
-temp_folder = r'C:\Users\LHB\Pictures\Temp_Results'
-
-# 创建结果文件夹、已处理文件夹和临时文件夹
-os.makedirs(result_folder, exist_ok=True)
-os.makedirs(processed_folder, exist_ok=True)
-os.makedirs(temp_folder, exist_ok=True)
-
-# 获取文件夹中的所有图片文件
-image_files = [f for f in os.listdir(image_folder) if f.endswith(('.jpg', '.png'))]
-
-# 检查是否有图片文件
-if not image_files:
-    print(f"在文件夹 {image_folder} 中没有找到任何图片文件。")
-    sys.exit(1)
-
-# 初始化 PaddleOCR
-try:
-    ocr = PaddleOCR(use_textline_orientation=True, lang='ch') # 使用 `use_textline_orientation=True` 替代已弃用的 use_angle_cls，`lang='ch'` 指定中文
-    print("PaddleOCR 初始化成功")
-except Exception as e:
-    print(f"PaddleOCR 初始化失败: {e}")
-    sys.exit(1)
-
-# 记录需要覆盖的文件
-files_to_overwrite = []
-
-# 处理每个图片文件
-for image_file in image_files:
-    image_path = os.path.join(image_folder, image_file)
-    print(f"正在处理图片文件: {image_path}")
+class FixedRatioLabelExtractor:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("固定界面比例的标签提取工具")
+        self.root.geometry("1200x750")
+        self.root.minsize(1000, 600)
+        
+        # 配置变量
+        self.input_path = tk.StringVar()
+        self.process_dir = tk.StringVar(value=os.path.join(os.path.dirname(os.path.abspath(__file__)), "Process_Images"))  # 默认值设置为与程序同目录下的Process_Images文件夹
+        self.output_dir = tk.StringVar(value=os.path.join(os.path.dirname(os.path.abspath(__file__)), "Output_Images"))  # 添加默认值
+        self.border_mm = tk.DoubleVar(value=1.0)
+        self.detection_method = tk.StringVar(value="auto")  # auto或manual
+        self.edge_threshold1 = tk.IntVar(value=50)
+        self.edge_threshold2 = tk.IntVar(value=150)
+        self.min_contour_area = tk.IntVar(value=500)
+        self.preview_mode = tk.StringVar(value="original")  # original, detected, edges
+        # 自动检测范围调整参数
+        self.auto_expand_ratio = tk.DoubleVar(value=1.0)  # 自动检测范围调整比例，1.0为原始大小，<1.0缩小，>1.0扩大
+        # 拼图白边设置
+        self.combo_margin = tk.IntVar(value=50)  # 二合一拼图白边宽度，默认50像素，0表示无白边
+        
+        # 图像相关变量
+        self.original_img = None  # 原始图像
+        self.processed_img = None  # 处理后的图像
+        self.edges_img = None  # 边缘检测图像
+        self.display_img = None  # 显示用图像
+        self.photo_img = None  # Tkinter显示用照片对象
+        self.scale_factor = 1.0  # 缩放因子
+        self.offset_x = 0  # 平移X偏移
+        self.offset_y = 0  # 平移Y偏移
+        self.last_x = 0  # 上次鼠标X位置
+        self.last_y = 0  # 上次鼠标Y位置
+        self.dragging = False  # 是否正在拖动
+        self.preview_updating = False  # 预览更新标志，防止递归更新
+        
+        # 检测结果变量
+        self.detected_contour = None  # 检测到的轮廓
+        self.detected_rect = None  # 检测到的矩形
+        
+        # 手动选择相关变量
+        self.manual_rect = None
+        self.selecting = False
+        self.start_x = 0
+        self.start_y = 0
+        self.temp_rect = None
+        
+        # 创建界面
+        self.create_widgets()
+        
+        # 绑定事件
+        self.preview_canvas.bind("<Button-1>", self.on_canvas_click)
+        self.preview_canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.preview_canvas.bind("<MouseWheel>", self.on_mouse_wheel)  # Windows
+        self.preview_canvas.bind("<Button-4>", self.on_mouse_wheel)   # Linux
+        self.preview_canvas.bind("<Button-5>", self.on_mouse_wheel)   # Linux
+        self.root.bind("<Configure>", self.on_window_resize)  # 窗口大小变化事件
+        
+        # 参数变化时自动更新预览，但添加延迟防止频繁更新
+        self.edge_threshold1.trace_add("write", lambda *args: self.schedule_preview_update())
+        self.edge_threshold2.trace_add("write", lambda *args: self.schedule_preview_update())
+        self.min_contour_area.trace_add("write", lambda *args: self.schedule_preview_update())
+        self.detection_method.trace_add("write", lambda *args: self.reset_manual_selection())
+        self.border_mm.trace_add("write", lambda *args: self.update_border_label())
+        # 自动扩展比例变化时更新预览
+        self.auto_expand_ratio.trace_add("write", lambda *args: self.schedule_preview_update())
+        # 拼图白边宽度变化时更新预览
+        self.combo_margin.trace_add("write", lambda *args: self.schedule_preview_update())
     
-    # 打开图片
-    try:
-        with Image.open(image_path) as image:
-            print(f"图片成功打开: {image_path}")
+    def create_widgets(self):
+        # 主框架 - 设置权重以固定比例
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.grid_columnconfigure(0, weight=2)  # 控制面板占2份
+        main_frame.grid_columnconfigure(1, weight=5)  # 预览区域占5份
+        main_frame.grid_rowconfigure(0, weight=1)
+        
+        # 左侧控制面板
+        control_frame = ttk.LabelFrame(main_frame, text="设置", padding="10")
+        control_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        # 输入输出设置
+        io_frame = ttk.LabelFrame(control_frame, text="文件设置", padding="5")
+        io_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(io_frame, text="输入图片:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Entry(io_frame, textvariable=self.input_path, width=25).grid(row=0, column=1, padx=5, pady=5, sticky="we")
+        ttk.Button(io_frame, text="浏览...", command=self.browse_input).grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(io_frame, text="输出目录:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        ttk.Entry(io_frame, textvariable=self.output_dir, width=25).grid(row=1, column=1, padx=5, pady=5, sticky="we")
+        ttk.Button(io_frame, text="浏览...", command=self.browse_output).grid(row=1, column=2, padx=5, pady=5)
+        
+        # 新增：过程文件夹设置
+        ttk.Label(io_frame, text="过程目录:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        ttk.Entry(io_frame, textvariable=self.process_dir, width=25).grid(row=2, column=1, padx=5, pady=5, sticky="we")
+        ttk.Button(io_frame, text="浏览...", command=self.browse_process).grid(row=2, column=2, padx=5, pady=5)
+        
+        io_frame.grid_columnconfigure(1, weight=1)
+        
+        # 检测方法设置
+        method_frame = ttk.LabelFrame(control_frame, text="检测设置", padding="5")
+        method_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(method_frame, text="检测方法:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        method_subframe = ttk.Frame(method_frame)
+        method_subframe.grid(row=0, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(method_subframe, text="自动检测", variable=self.detection_method, value="auto").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(method_subframe, text="手动框选", variable=self.detection_method, value="manual").pack(side=tk.LEFT, padx=5)
+        
+        # 新增：自动检测范围调整 - 改进布局和标签
+        auto_detect_settings_frame = ttk.LabelFrame(control_frame, text="自动检测参数", padding="5")
+        auto_detect_settings_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(auto_detect_settings_frame, text="检测范围调整比例:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(auto_detect_settings_frame, variable=self.auto_expand_ratio, from_=0.5, to=2.0, orient="horizontal", 
+                 length=150, command=lambda v: self.update_label(self.expand_label, f"{float(v):.2f}x")).grid(row=1, column=0, padx=5, pady=5, sticky="we")
+        self.expand_label = ttk.Label(auto_detect_settings_frame, text=f"{self.auto_expand_ratio.get():.2f}x")
+        self.expand_label.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        
+        # 边界设置 - 显示小数点后三位
+        ttk.Label(method_frame, text="边界宽度(mm):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(method_frame, variable=self.border_mm, from_=0.1, to=5.0, orient="horizontal", 
+                 length=150).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.border_label = ttk.Label(method_frame, text=f"{self.border_mm.get():.3f} mm")
+        self.border_label.grid(row=2, column=2, padx=5, pady=5, sticky="w")
+        
+        # 边缘检测参数
+        ttk.Label(method_frame, text="边缘阈值1:").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(method_frame, variable=self.edge_threshold1, from_=10, to=200, orient="horizontal", 
+                 length=150, command=lambda v: self.update_label(self.edge1_label, f"{int(float(v))}")).grid(row=3, column=1, padx=5, pady=5, sticky="w")
+        self.edge1_label = ttk.Label(method_frame, text=f"{self.edge_threshold1.get()}")
+        self.edge1_label.grid(row=3, column=2, padx=5, pady=5, sticky="w")
+        
+        ttk.Label(method_frame, text="边缘阈值2:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(method_frame, variable=self.edge_threshold2, from_=100, to=400, orient="horizontal", 
+                 length=150, command=lambda v: self.update_label(self.edge2_label, f"{int(float(v))}")).grid(row=4, column=1, padx=5, pady=5, sticky="w")
+        self.edge2_label = ttk.Label(method_frame, text=f"{self.edge_threshold2.get()}")
+        self.edge2_label.grid(row=4, column=2, padx=5, pady=5, sticky="w")
+        
+        ttk.Label(method_frame, text="最小轮廓面积:").grid(row=5, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(method_frame, variable=self.min_contour_area, from_=100, to=5000, orient="horizontal", 
+                 length=150, command=lambda v: self.update_label(self.area_label, f"{int(float(v))}")).grid(row=5, column=1, padx=5, pady=5, sticky="w")
+        self.area_label = ttk.Label(method_frame, text=f"{self.min_contour_area.get()}")
+        self.area_label.grid(row=5, column=2, padx=5, pady=5, sticky="w")
+        
+        # 拼图白边宽度设置
+        ttk.Label(method_frame, text="拼图白边宽度(像素):").grid(row=6, column=0, padx=5, pady=5, sticky="w")
+        ttk.Scale(method_frame, variable=self.combo_margin, from_=0, to=100, orient="horizontal", 
+                 length=150, command=lambda v: self.update_label(self.margin_label, f"{int(float(v))}")).grid(row=6, column=1, padx=5, pady=5, sticky="w")
+        self.margin_label = ttk.Label(method_frame, text=f"{self.combo_margin.get()}")
+        self.margin_label.grid(row=6, column=2, padx=5, pady=5, sticky="w")
+        
+        method_frame.grid_columnconfigure(1, weight=1)
+        
+        # 预览模式设置
+        preview_frame = ttk.LabelFrame(control_frame, text="预览设置", padding="5")
+        preview_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(preview_frame, text="预览模式:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        preview_subframe = ttk.Frame(preview_frame)
+        preview_subframe.grid(row=0, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(preview_subframe, text="原图", variable=self.preview_mode, value="original", command=self.update_preview).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(preview_subframe, text="检测结果", variable=self.preview_mode, value="detected", command=self.update_preview).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(preview_subframe, text="边缘图像", variable=self.preview_mode, value="edges", command=self.update_preview).pack(side=tk.LEFT, padx=5)
+        
+        # 操作按钮
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack(fill=tk.X, pady=20)
+        
+        ttk.Button(button_frame, text="更新预览", command=self.update_preview, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="提取标签", command=self.process_image, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="适应窗口", command=self.fit_to_window, width=15).pack(side=tk.LEFT, padx=5)
+        
+        # 右侧预览区域
+        preview_container = ttk.LabelFrame(main_frame, text="预览区域", padding="10")
+        preview_container.grid(row=0, column=1, sticky="nsew")
+        
+        # 预览画布 - 设置固定的初始滚动区域以防止跳动
+        self.preview_canvas = tk.Canvas(preview_container, bg="#f0f0f0", cursor="cross", scrollregion=(0, 0, 1000, 1000))
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # 添加滚动条
+        scrollbar_x = ttk.Scrollbar(preview_container, orient=tk.HORIZONTAL, command=self.preview_canvas.xview)
+        scrollbar_y = ttk.Scrollbar(preview_container, orient=tk.VERTICAL, command=self.preview_canvas.yview)
+        self.preview_canvas.configure(xscrollcommand=scrollbar_x.set, yscrollcommand=scrollbar_y.set)
+        
+        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 状态栏
+        status_frame = ttk.Frame(self.root, height=20)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_label = ttk.Label(status_frame, text="就绪", anchor=tk.W)
+        self.status_label.pack(side=tk.LEFT, padx=10, pady=2)
+    
+    def update_label(self, label, text):
+        """更新标签文本"""
+        label.config(text=text)
+    
+    def update_border_label(self):
+        """更新边界宽度标签，显示小数点后三位"""
+        self.border_label.config(text=f"{self.border_mm.get():.3f} mm")
+    
+    def browse_input(self):
+        """浏览选择输入图片"""
+        file_path = filedialog.askopenfilename(
+            title="选择输入图片",
+            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.bmp")]
+        )
+        if file_path:
+            self.input_path.set(file_path)
+            self.load_image(file_path)
+            self.reset_manual_selection()
+            self.fit_to_window()  # 加载图片后自动适应窗口
+            self.status_label.config(text=f"已加载图片: {os.path.basename(file_path)}")
+    
+    def browse_output(self):
+        """浏览选择输出目录"""
+        dir_path = filedialog.askdirectory(title="选择输出目录")
+        if dir_path:
+            self.output_dir.set(dir_path)
+            self.status_label.config(text=f"输出目录: {dir_path}")
+    
+    def browse_process(self):
+        """浏览选择过程目录"""
+        dir_path = filedialog.askdirectory(title="选择过程目录")
+        if dir_path:
+            self.process_dir.set(dir_path)
+            self.status_label.config(text=f"过程目录: {dir_path}")
 
-            # 进行文字识别
-            try:
-                ocr_result = ocr.ocr(image_path, cls=True)
-                print(f"文字识别成功: {image_path}")
-                print("识别结果:", ocr_result)
-            except Exception as e:
-                print(f"文字识别失败: {e}")
-                continue
-
-            # 进行二维码和条形码识别
-            qr_results = []
-            try:
-                img = cv2.imread(image_path)
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                detector = cv2.QRCodeDetector()
-                retval, decoded_info, points, _ = detector.detectAndDecodeMulti(gray)
-                if retval:
-                    for barcode_data in decoded_info:
-                        if barcode_data:
-                            print(f"识别到的二维码/条形码: {barcode_data}")
-                            qr_results.append(barcode_data)
-                else:
-                    print("未识别到二维码/条形码")
-            except Exception as e:
-                print(f"二维码/条形码识别失败: {e}")
-
-            # 保存识别结果到临时文件夹
-            temp_result_file_path = os.path.join(temp_folder, f"{os.path.splitext(image_file)[0]}_result.txt")
-            try:
-                with open(temp_result_file_path, 'w', encoding='utf-8') as result_file:
-                    # 保存文字识别结果
-                    for res in ocr_result:
-                        for line in res:
-                            result_file.write(line[1][0] + '\n')
-                    # 保存二维码/条形码识别结果
-                    for qr_result in qr_results:
-                        result_file.write(qr_result + '\n')
-                print(f"识别结果已保存到临时文件: {temp_result_file_path}")
-            except Exception as e:
-                print(f"保存识别结果失败: {e}")
-                continue
-
-            # 检查结果文件是否已存在
-            result_file_path = os.path.join(result_folder, f"{os.path.splitext(image_file)[0]}_result.txt")
-            if os.path.exists(result_file_path):
-                files_to_overwrite.append((result_file_path, temp_result_file_path))
-                print(f"结果文件已存在，需要覆盖: {result_file_path}")
+    def load_image(self, file_path):
+        """加载图像"""
+        try:
+            self.original_img = cv2.imread(file_path)
+            if self.original_img is None:
+                raise ValueError("无法读取图像文件")
+            
+            # 转换为RGB用于显示
+            self.processed_img = cv2.cvtColor(self.original_img, cv2.COLOR_BGR2RGB)
+            self.edges_img = None  # 重置边缘图像
+            self.detected_contour = None  # 重置检测结果
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"加载图片失败: {str(e)}")
+            self.status_label.config(text=f"加载图片失败: {str(e)}")
+    
+    def schedule_preview_update(self):
+        """延迟调度预览更新，避免参数调整时频繁更新"""
+        if self.original_img is None:
+            return
+            
+        # 取消之前的调度，只执行最后一次
+        try:
+            self.root.after_cancel(self.update_after_id)
+        except:
+            pass
+            
+        # 延迟50毫秒更新，避免滑块拖动时频繁刷新
+        self.update_after_id = self.root.after(50, self.update_preview)
+    
+    def fit_to_window(self):
+        """调整图像大小以适应窗口"""
+        if self.original_img is None or self.preview_updating:
+            return
+            
+        # 获取画布尺寸
+        canvas_width = self.preview_canvas.winfo_width()
+        canvas_height = self.preview_canvas.winfo_height()
+        
+        # 如果画布还没渲染，使用窗口尺寸估算
+        if canvas_width < 100 or canvas_height < 100:
+            canvas_width = int(self.root.winfo_width() * 5 / 7) - 50  # 根据比例计算
+            canvas_height = self.root.winfo_height() - 100  # 减去边距和状态栏
+        
+        # 获取图像尺寸
+        img_height, img_width = self.processed_img.shape[:2]
+        
+        # 计算适应窗口的缩放因子
+        scale_width = canvas_width / img_width
+        scale_height = canvas_height / img_height
+        self.scale_factor = min(scale_width, scale_height) * 0.95  # 留5%的边距
+        
+        # 居中显示
+        self.offset_x = max(0, (canvas_width - img_width * self.scale_factor) / 2)
+        self.offset_y = max(0, (canvas_height - img_height * self.scale_factor) / 2)
+        
+        self.update_preview()
+    
+    def on_window_resize(self, event):
+        """窗口大小变化时自动调整，保持固定比例"""
+        # 避免在窗口初始化时触发，避免预览更新时递归触发
+        if self.original_img is not None and event.widget == self.root and not self.preview_updating:
+            # 检查是否是显著的尺寸变化
+            if abs(event.width - self.root.winfo_width()) > 50 or abs(event.height - self.root.winfo_height()) > 50:
+                self.fit_to_window()
+    
+    def reset_manual_selection(self):
+        """重置手动选择区域"""
+        self.manual_rect = None
+        self.temp_rect = None
+        if self.detection_method.get() == "manual":
+            self.status_label.config(text="请在预览区域拖动鼠标框选标签")
+        else:
+            self.update_preview()
+    
+    def on_canvas_click(self, event):
+        """处理画布点击事件 - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
+            return
+            
+        if self.detection_method.get() == "manual":
+            # 手动框选模式
+            self.selecting = True
+            x, y = self.screen_to_image(event.x, event.y)
+            self.start_x, self.start_y = x, y
+            self.temp_rect = None
+        else:
+            # 自动模式下允许拖动图像
+            self.dragging = True
+            self.last_x = event.x
+            self.last_y = event.y
+    
+    def on_canvas_drag(self, event):
+        """处理画布拖动事件 - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
+            return
+            
+        if self.detection_method.get() == "manual" and self.selecting:
+            # 手动框选拖动
+            x, y = self.screen_to_image(event.x, event.y)
+            self.temp_rect = (
+                min(self.start_x, x), 
+                min(self.start_y, y),
+                abs(x - self.start_x),
+                abs(y - self.start_y)
+            )
+            self.update_preview()
+        elif self.dragging:
+            # 图像拖动
+            dx = event.x - self.last_x
+            dy = event.y - self.last_y
+            self.offset_x += dx
+            self.offset_y += dy
+            self.last_x = event.x
+            self.last_y = event.y
+            self.update_preview()
+    
+    def on_canvas_release(self, event):
+        """处理画布释放事件 - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
+            return
+            
+        if self.detection_method.get() == "manual" and self.selecting:
+            # 完成手动框选
+            self.selecting = False
+            if self.temp_rect and self.temp_rect[2] > 10 and self.temp_rect[3] > 10:  # 确保区域足够大
+                self.manual_rect = self.temp_rect
+                self.status_label.config(text="已选择标签区域")
             else:
-                try:
-                    shutil.move(temp_result_file_path, result_file_path)
-                    print(f"结果文件已移动到: {result_file_path}")
-                except Exception as e:
-                    print(f"移动临时结果文件失败: {e}")
-
-    except Exception as e:
-        print(f"处理图片失败: {e}")
-        continue
-
-    # 移动已处理的图片到新的文件夹
-    try:
-        shutil.copy(image_path, os.path.join(processed_folder, image_file))
-        print(f"图片已复制到: {os.path.join(processed_folder, image_file)}")
-    except Exception as e:
-        print(f"复制图片失败: {e}")
-
-# 处理需要覆盖的文件
-root = tk.Tk()
-root.withdraw()  # 隐藏主窗口
-for result_file_path, temp_result_file_path in files_to_overwrite:
-    if messagebox.askyesno("文件已存在", f"{result_file_path} 已存在。是否覆盖？"):
+                self.temp_rect = None
+                self.status_label.config(text="选择区域过小，请重新选择")
+            self.update_preview()
+        else:
+            # 结束拖动
+            self.dragging = False
+    
+    def on_mouse_wheel(self, event):
+        """处理鼠标滚轮事件（缩放） - 修复判断条件"""
+        if self.original_img is None:  # 正确判断图像是否加载
+            return
+            
+        # 获取鼠标在图像上的位置
+        x, y = event.x, event.y
+        img_x, img_y = self.screen_to_image(x, y)
+        
+        # 处理滚轮事件
+        if event.delta > 0 or event.num == 4:  # 放大
+            self.scale_factor *= 1.1
+        elif event.delta < 0 or event.num == 5:  # 缩小
+            self.scale_factor /= 1.1
+            self.scale_factor = max(0.1, self.scale_factor)  # 限制最小缩放
+        
+        # 调整偏移量，使鼠标指向的点保持在同一位置
+        new_x, new_y = self.image_to_screen(img_x, img_y)
+        self.offset_x += x - new_x
+        self.offset_y += y - new_y
+        
+        self.update_preview()
+    
+    def image_to_screen(self, x, y):
+        """将图像坐标转换为屏幕坐标"""
+        return int(x * self.scale_factor + self.offset_x), int(y * self.scale_factor + self.offset_y)
+    
+    def screen_to_image(self, x, y):
+        """将屏幕坐标转换为图像坐标"""
+        return int((x - self.offset_x) / self.scale_factor), int((y - self.offset_y) / self.scale_factor)
+    
+    def mm_to_pixels(self, mm, dpi):
+        """将毫米转换为像素"""
+        return int(round(mm * dpi / 25.4))
+    
+    def get_image_dpi(self, image_path):
+        """获取图像的DPI信息"""
         try:
-            shutil.move(temp_result_file_path, result_file_path)
-            print(f"文件已覆盖: {result_file_path}")
+            with Image.open(image_path) as img:
+                dpi = img.info.get('dpi', (300, 300))
+                return (int(dpi[0]), int(dpi[1]))
         except Exception as e:
-            print(f"覆盖文件失败: {e}")
-    else:
+            print(f"获取DPI信息失败: {e}，使用默认300DPI")
+            return (300, 300)
+    
+    def preprocess_image(self, img):
+        """图像预处理，提高后续检测稳定性"""
+        # 转换为灰度图
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 去噪
+        denoised = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        return denoised
+    
+    def get_best_label_contour(self, contours, img_shape):
+        """优化的轮廓筛选：选择最可能是标签的轮廓"""
+        if not contours:
+            return None
+            
+        best_contour = None
+        best_score = -1
+        img_area = img_shape[0] * img_shape[1]
+        
+        for contour in contours:
+            # 计算轮廓面积
+            area = cv2.contourArea(contour)
+            
+            # 过滤面积过小或过大的轮廓
+            if area < self.min_contour_area.get() or area > img_area * 0.8:
+                continue
+                
+            # 计算边界框
+            x, y, w, h = cv2.boundingRect(contour)
+            bounding_area = w * h
+            
+            # 计算矩形度（面积与边界框面积的比值，越接近1越可能是矩形标签）
+            rectangularity = area / bounding_area if bounding_area > 0 else 0
+            
+            # 计算纵横比（标签通常不会太狭长）
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+            aspect_score = 1.0 / aspect_ratio  # 纵横比越小得分越高
+            
+            # 计算紧凑度（圆形度）- 标签通常是矩形，这个值会较低
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+            compactness = (4 * np.pi * area) / (perimeter * perimeter)
+            compactness_score = 1 - compactness  # 矩形更符合，所以这个值高更好
+            
+            # 计算位置分数（中心区域的轮廓更可能是标签）
+            center_x, center_y = img_shape[1] // 2, img_shape[0] // 2
+            contour_center_x = x + w // 2
+            contour_center_y = y + h // 2
+            distance_from_center = np.sqrt((contour_center_x - center_x)**2 + 
+                                         (contour_center_y - center_y)** 2)
+            position_score = 1 / (1 + distance_from_center / max(img_shape[0], img_shape[1]))
+            
+            # 综合评分
+            score = (0.3 * rectangularity + 
+                    0.2 * aspect_score + 
+                    0.2 * compactness_score + 
+                    0.1 * position_score + 
+                    0.2 * (area / img_area))
+            
+            # 更新最佳轮廓
+            if score > best_score:
+                best_score = score
+                best_contour = contour
+                
+        return best_contour
+    
+    def detect_label_auto(self, img):
+        """自动检测标签"""
+        if img is None:
+            return None, None
+            
+        # 预处理
+        preprocessed = self.preprocess_image(img)
+        
+        # 边缘检测
+        edges = cv2.Canny(preprocessed, self.edge_threshold1.get(), self.edge_threshold2.get())
+        
+        # 边缘增强
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        
+        # 找到所有轮廓
+        contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 筛选最佳轮廓
+        best_contour = self.get_best_label_contour(contours, preprocessed.shape)
+        
+        # 转换边缘图像为RGB用于显示
+        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        
+        return best_contour, edges_rgb
+    
+    def update_preview(self):
+        """更新预览区域显示，保持视图稳定"""
+        if self.original_img is None or self.preview_updating:
+            return
+            
+        # 设置更新标志，防止递归更新
+        self.preview_updating = True
+        
         try:
-            os.remove(temp_result_file_path)
-            print(f"跳过文件: {result_file_path}")
-        except Exception as e:
-            print(f"删除临时文件失败: {e}")
+            # 保存当前画布尺寸
+            canvas_width = self.preview_canvas.winfo_width()
+            canvas_height = self.preview_canvas.winfo_height()
+            
+            # 根据预览模式选择要显示的图像
+            if self.preview_mode.get() == "original":
+                display_img = self.processed_img.copy()
+            elif self.preview_mode.get() == "edges":
+                # 如果还没有计算边缘，先计算
+                if self.edges_img is None:
+                    _, self.edges_img = self.detect_label_auto(self.original_img)
+                display_img = self.edges_img.copy() if self.edges_img is not None else self.processed_img.copy()
+                
+                # 在边缘图像中也显示检测框
+                if self.detection_method.get() == "auto" and self.detected_contour is not None:
+                    # 获取原始边界框
+                    x, y, w, h = cv2.boundingRect(self.detected_contour)
+                    
+                    # 根据auto_expand_ratio调整边界框大小
+                    expand_ratio = self.auto_expand_ratio.get()
+                    
+                    # 计算中心点
+                    center_x = x + w // 2
+                    center_y = y + h // 2
+                    
+                    # 计算新的宽高
+                    new_w = int(w * expand_ratio)
+                    new_h = int(h * expand_ratio)
+                    
+                    # 从中心点计算新的左上角坐标
+                    adjusted_x = max(0, center_x - new_w // 2)
+                    adjusted_y = max(0, center_y - new_h // 2)
+                    
+                    # 确保不超出图像边界
+                    adjusted_w = min(display_img.shape[1] - adjusted_x, new_w)
+                    adjusted_h = min(display_img.shape[0] - adjusted_y, new_h)
+                    
+                    # 绘制调整后的边界框
+                    cv2.rectangle(display_img, (adjusted_x, adjusted_y), 
+                                 (adjusted_x + adjusted_w, adjusted_y + adjusted_h), (0, 0, 255), 2)
+                elif self.detection_method.get() == "manual" and self.manual_rect:
+                    # 手动模式下显示选择框
+                    x, y, w, h = self.manual_rect
+                    cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            else:  # detected
+                display_img = self.processed_img.copy()
+                # 自动检测模式下绘制检测结果
+                if self.detection_method.get() == "auto":
+                    self.detected_contour, self.edges_img = self.detect_label_auto(self.original_img)
+                    if self.detected_contour is not None:
+                        # 绘制原始轮廓
+                        cv2.drawContours(display_img, [self.detected_contour], -1, (0, 255, 0), 2)
+                        # 获取原始边界框
+                        x, y, w, h = cv2.boundingRect(self.detected_contour)
+                        
+                        # 根据auto_expand_ratio调整边界框大小
+                        # 计算扩展或缩小的像素数量
+                        expand_ratio = self.auto_expand_ratio.get()
+                        
+                        # 计算中心点
+                        center_x = x + w // 2
+                        center_y = y + h // 2
+                        
+                        # 计算新的宽高
+                        new_w = int(w * expand_ratio)
+                        new_h = int(h * expand_ratio)
+                        
+                        # 从中心点计算新的左上角坐标
+                        adjusted_x = max(0, center_x - new_w // 2)
+                        adjusted_y = max(0, center_y - new_h // 2)
+                        
+                        # 确保不超出图像边界
+                        adjusted_w = min(display_img.shape[1] - adjusted_x, new_w)
+                        adjusted_h = min(display_img.shape[0] - adjusted_y, new_h)
+                        
+                        # 绘制调整后的边界框
+                        cv2.rectangle(display_img, (adjusted_x, adjusted_y), 
+                                     (adjusted_x + adjusted_w, adjusted_y + adjusted_h), (0, 0, 255), 2)
+                        
+                        # 保存调整后的边界框
+                        self.detected_rect = (adjusted_x, adjusted_y, adjusted_w, adjusted_h)
+                        
+                        # 计算YOLO格式的标签位置信息 (类别ID, 中心点x, 中心点y, 宽度, 高度)
+                        # 所有值都是相对于图像尺寸的比例
+                        img_height, img_width = display_img.shape[:2]
+                        yolo_x = (adjusted_x + adjusted_w / 2) / img_width
+                        yolo_y = (adjusted_y + adjusted_h / 2) / img_height
+                        yolo_w = adjusted_w / img_width
+                        yolo_h = adjusted_h / img_height
+                        
+                        # 在右下角显示YOLO格式的标签位置信息
+                        yolo_text = f"label {yolo_x:.6f} {yolo_y:.6f} {yolo_w:.6f} {yolo_h:.6f}"
+                        text_size = cv2.getTextSize(yolo_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+                        text_x = img_width - text_size[0] - 10
+                        text_y = img_height - 10
+                        
+                        # 添加半透明背景
+                        overlay = display_img.copy()
+                        cv2.rectangle(overlay, (text_x - 5, text_y - text_size[1] - 5), 
+                                     (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)
+                        cv2.addWeighted(overlay, 0.6, display_img, 0.4, 0, display_img)
+                        
+                        # 添加文本
+                        cv2.putText(display_img, yolo_text, (text_x, text_y), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    else:
+                        self.detected_rect = None
+                        cv2.putText(display_img, "未检测到标签，请调整参数", (50, 50), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            
+            # 手动模式下绘制选择框
+            if self.detection_method.get() == "manual":
+                if self.temp_rect:
+                    x, y, w, h = self.temp_rect
+                    cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                if self.manual_rect:
+                    x, y, w, h = self.manual_rect
+                    cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cv2.putText(display_img, "标签区域", (x, y - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    
+                    # 计算YOLO格式的标签位置信息 (类别ID, 中心点x, 中心点y, 宽度, 高度)
+                    img_height, img_width = display_img.shape[:2]
+                    yolo_x = (x + w / 2) / img_width
+                    yolo_y = (y + h / 2) / img_height
+                    yolo_w = w / img_width
+                    yolo_h = h / img_height
+                    
+                    # 在右下角显示YOLO格式的标签位置信息
+                    yolo_text = f"label {yolo_x:.6f} {yolo_y:.6f} {yolo_w:.6f} {yolo_h:.6f}"
+                    text_size = cv2.getTextSize(yolo_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+                    text_x = img_width - text_size[0] - 10
+                    text_y = img_height - 10
+                    
+                    # 添加半透明背景
+                    overlay = display_img.copy()
+                    cv2.rectangle(overlay, (text_x - 5, text_y - text_size[1] - 5), 
+                                 (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.6, display_img, 0.4, 0, display_img)
+                    
+                    # 添加文本
+                    cv2.putText(display_img, yolo_text, (text_x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            # 调整图像大小用于显示（保持当前缩放比例）
+            h, w = display_img.shape[:2]
+            scaled_h, scaled_w = int(h * self.scale_factor), int(w * self.scale_factor)
+            resized_img = cv2.resize(display_img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+            
+            # 转换为PhotoImage
+            self.photo_img = ImageTk.PhotoImage(image=Image.fromarray(resized_img))
+            
+            # 更新画布，但保持当前视图位置
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(self.offset_x, self.offset_y, image=self.photo_img, anchor=tk.NW)
+            
+            # 维持滚动区域稳定，只在必要时调整
+            if canvas_width > 0 and canvas_height > 0:
+                scroll_width = max(scaled_w + self.offset_x * 2, canvas_width)
+                scroll_height = max(scaled_h + self.offset_y * 2, canvas_height)
+                self.preview_canvas.config(scrollregion=(0, 0, scroll_width, scroll_height))
+                
+            # 新增：保存检测结果和边缘图像到过程文件夹
+            if self.preview_mode.get() == "detected" and self.detected_contour is not None:
+                # 确保过程文件夹存在
+                process_dir = self.process_dir.get()
+                if process_dir and not os.path.exists(process_dir):
+                    os.makedirs(process_dir)
+                
+                # 保存检测结果图像
+                detected_result_path = os.path.join(process_dir, "detected_result.jpg")
+                detected_display_img = self.processed_img.copy()
+                
+                # 绘制原始轮廓
+                cv2.drawContours(detected_display_img, [self.detected_contour], -1, (0, 255, 0), 2)
+                
+                # 获取原始边界框
+                x, y, w, h = cv2.boundingRect(self.detected_contour)
+                
+                # 根据auto_expand_ratio调整边界框大小
+                expand_ratio = self.auto_expand_ratio.get()
+                
+                # 计算中心点
+                center_x = x + w // 2
+                center_y = y + h // 2
+                
+                # 计算新的宽高
+                new_w = int(w * expand_ratio)
+                new_h = int(h * expand_ratio)
+                
+                # 从中心点计算新的左上角坐标
+                adjusted_x = max(0, center_x - new_w // 2)
+                adjusted_y = max(0, center_y - new_h // 2)
+                
+                # 确保不超出图像边界
+                adjusted_w = min(detected_display_img.shape[1] - adjusted_x, new_w)
+                adjusted_h = min(detected_display_img.shape[0] - adjusted_y, new_h)
+                
+                # 绘制调整后的边界框
+                cv2.rectangle(detected_display_img, (adjusted_x, adjusted_y), 
+                             (adjusted_x + adjusted_w, adjusted_y + adjusted_h), (0, 0, 255), 2)
+                
+                cv2.imwrite(detected_result_path, cv2.cvtColor(detected_display_img, cv2.COLOR_RGB2BGR))
+                
+                # 保存边缘图像
+                edges_result_path = os.path.join(process_dir, "edges_result.jpg")
+                cv2.imwrite(edges_result_path, self.edges_img)
+                
+        finally:
+            # 重置更新标志
+            self.preview_updating = False
+    
+    def process_image(self):
+        """处理图像并提取标签"""
+        input_path = self.input_path.get()
+        output_dir = self.output_dir.get()
+        
+        # 验证输入
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showerror("错误", "请选择有效的输入图片")
+            return
+        
+        if not output_dir or not os.path.exists(output_dir):
+            messagebox.showerror("错误", "请选择有效的输出目录")
+            return
+        
+        try:
+            # 读取图像
+            img = cv2.imread(input_path)
+            if img is None:
+                raise ValueError("无法读取图像")
+            
+            # 获取DPI
+            dpi_x, dpi_y = self.get_image_dpi(input_path)
+            border_x = self.mm_to_pixels(self.border_mm.get(), dpi_x)
+            border_y = self.mm_to_pixels(self.border_mm.get(), dpi_y)
+            
+            # 检测标签
+            method = self.detection_method.get()
+            x_min, y_min, x_max, y_max = 0, 0, img.shape[1], img.shape[0]
+            label_rect = None  # 新增：用于拼图
 
-# 删除临时文件夹
-try:
-    shutil.rmtree(temp_folder)
-    print(f"临时文件夹已删除: {temp_folder}")
-except Exception as e:
-    print(f"删除临时文件夹失败: {e}")
+            if method == "auto":
+                if self.detected_contour is None:
+                    self.detected_contour, _ = self.detect_label_auto(img)
+                if self.detected_contour is None:
+                    raise ValueError("自动检测失败，请调整参数或使用手动模式")
+                
+                # 获取原始边界框
+                x, y, w, h = cv2.boundingRect(self.detected_contour)
+                x_min, y_min = x, y
+                x_max, y_max = x + w, y + h
+                
+                # 根据auto_expand_ratio调整边界框大小
+                if self.auto_expand_ratio.get() != 1.0:
+                    # 计算中心点
+                    center_x = (x_min + x_max) // 2
+                    center_y = (y_min + y_max) // 2
+                    
+                    # 计算原始宽高
+                    original_width = x_max - x_min
+                    original_height = y_max - y_min
+                    
+                    # 计算新的宽高
+                    expand_ratio = self.auto_expand_ratio.get()
+                    new_width = int(original_width * expand_ratio)
+                    new_height = int(original_height * expand_ratio)
+                    
+                    # 从中心点计算新的边界
+                    x_min = max(0, center_x - new_width // 2)
+                    y_min = max(0, center_y - new_height // 2)
+                    x_max = min(img.shape[1], x_min + new_width)
+                    y_max = min(img.shape[0], y_min + new_height)
+                
+                # 计算标签区域用于拼图
+                label_rect = (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
+            else:  # manual
+                if not self.manual_rect:
+                    raise ValueError("请先在预览区域框选标签")
+                x, y, w, h = self.manual_rect
+                x_min, y_min = x, y
+                x_max, y_max = x + w, y + h
+                label_rect = (x, y, w, h)
+
+            # 扩展边界
+            height, width = img.shape[:2]
+            x_start = max(0, x_min - border_x)
+            y_start = max(0, y_min - border_y)
+            x_end = min(width, x_max + border_x)
+            y_end = min(height, y_max + border_y)
+            
+            # 裁剪图像
+            cropped_img = img[y_start:y_end, x_start:x_end]
+            
+            # 保存结果
+            filename = os.path.basename(input_path)
+            name, ext = os.path.splitext(filename)
+            # 只调用拼图功能，让其负责裁切和保存标签
+            combo_path = os.path.join(output_dir, f"{name}_combo拼图.jpg")
+            label_path = os.path.join(output_dir, f"{name}_label{ext}")
+            self.process_qr_code(img, None, combo_path, 0, label_path=label_path)
+            messagebox.showinfo("成功", f"标签提取和拼图完成，已保存至:\n{label_path}\n{combo_path}")
+            self.status_label.config(text=f"标签和拼图已保存: {os.path.basename(label_path)}, {os.path.basename(combo_path)}")
+        except Exception as e:
+            messagebox.showerror("处理失败", f"发生错误: {str(e)}")
+            self.status_label.config(text=f"处理失败: {str(e)}")
+
+    def process_qr_code(self, img, qr_points, output_path, qr_index, label_rect=None, label_path=None):
+        """
+        二合一拼图功能：
+        1. 自动检测标签位置并裁切标签
+        2. 保存标签图片
+        3. 新建白色背景，拼合图片
+        4. 从原图标签中心画箭头指向标签图像中心
+        5. 保存拼图
+        img: 原始图像（BGR）
+        qr_points: 二维码的四个角点 (N, 1, 2) 或 (4, 2)
+        output_path: 拼图保存路径
+        qr_index: 二维码序号
+        label_rect: (x, y, w, h) 标签区域（可选，优先使用）
+        label_path: 标签图片保存路径
+        """
+        try:
+            # 1. 自动检测标签位置
+            if label_rect:
+                x_lbl, y_lbl, w_lbl, h_lbl = label_rect
+            elif self.detected_rect:
+                x_lbl, y_lbl, w_lbl, h_lbl = self.detected_rect
+            elif self.manual_rect:
+                x_lbl, y_lbl, w_lbl, h_lbl = self.manual_rect
+            else:
+                print("未检测到标签区域，无法拼图")
+                return
+
+            # 2. 自动裁切标签并保存
+            label_img = img[y_lbl:y_lbl + h_lbl, x_lbl:x_lbl + w_lbl]
+            if label_path:
+                # 直接保存标签图像，不添加YOLO信息
+                cv2.imwrite(label_path, label_img)
+
+            # 3. 新建白色背景，使用配置的白边宽度
+            margin = self.combo_margin.get()
+            orig_h, orig_w = img.shape[:2]
+            label_h, label_w = label_img.shape[:2]
+            
+            if margin > 0:
+                # 有白边模式
+                new_h = orig_h + label_h + margin * 2
+                new_w = max(orig_w, label_w) + margin * 2
+                new_img = np.ones((new_h, new_w, 3), dtype=np.uint8) * 255
+            else:
+                # 无白边模式 - 但仍需保持一定间隔
+                min_gap = 20  # 最小间隔像素
+                new_h = orig_h + label_h + min_gap  # 添加间隔
+                new_w = max(orig_w, label_w)
+                new_img = np.ones((new_h, new_w, 3), dtype=np.uint8) * 255
+
+            # 4. 拼合图片，根据白边宽度调整位置
+            if margin > 0:
+                # 有白边模式
+                orig_x = margin
+                orig_y = margin
+                new_img[orig_y:orig_y + orig_h, orig_x:orig_x + orig_w] = img
+                label_x = new_w - label_w - margin
+                label_y = orig_y + orig_h + margin
+            else:
+                # 无白边模式 - 但保持间隔
+                min_gap = 20  # 最小间隔像素
+                orig_x = 0
+                orig_y = 0
+                new_img[orig_y:orig_y + orig_h, orig_x:orig_x + orig_w] = img
+                label_x = new_w - label_w  # 右侧放置标签
+                label_y = orig_h + min_gap  # 原图下方加间隔
+            
+            # 放置标签图像
+            new_img[label_y:label_y + label_h, label_x:label_x + label_w] = label_img
+
+            # 5. 生成指示性箭头，无论有无白边都绘制
+            tag_cx = orig_x + x_lbl + w_lbl // 2
+            tag_cy = orig_y + y_lbl + h_lbl // 2
+            label_cx = label_x + label_w // 2
+            label_cy = label_y + label_h // 2
+            cv2.arrowedLine(new_img, (tag_cx, tag_cy), (label_cx, label_cy), (0, 0, 255), 4, tipLength=0.15)
+
+            # 6. 保存拼图
+            cv2.imwrite(output_path, new_img)
+            print(f"标签已保存至: {label_path}")
+            print(f"二合一拼图已保存至: {output_path}")
+        except Exception as e:
+            print(f"二合一拼图处理失败: {e}")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    # 设置中文字体支持
+    root.option_add("*Font", "SimHei 10")
+    app = FixedRatioLabelExtractor(root)
+    root.mainloop()
+    # 设置中文字体支持
+    root.option_add("*Font", "SimHei 10")
+    app = FixedRatioLabelExtractor(root)
+    root.mainloop()

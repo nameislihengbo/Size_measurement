@@ -73,32 +73,71 @@ def save_image(frame):
         return None
 
 
+def detect_label_auto(img):
+    """自动检测标签区域，返回(x, y, w, h)"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(denoised, 50, 150)
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 选最大矩形轮廓
+    best = None
+    max_area = 0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > max_area:
+            max_area = area
+            best = c
+    if best is not None:
+        x, y, w, h = cv2.boundingRect(best)
+        return (x, y, w, h)
+    return None
+
+
 def process_qr_code(img, points, output_path, qr_index):
+    """
+    拼图功能：原图+自动裁切标签，箭头指示
+    """
     try:
-        # 抠出二维码
-        points = points.astype(int)
-        x, y, w, h = cv2.boundingRect(points)
-        qr_code = img[y:y + h, x:x + w]
+        # 1. 计算标签位置
+        label_rect = detect_label_auto(img)
+        if not label_rect:
+            print("未检测到标签，跳过拼图")
+            return
+        x_lbl, y_lbl, w_lbl, h_lbl = label_rect
 
-        # 创建白色背景图片
-        new_img_height = img.shape[0] + qr_code.shape[0] + 50
-        new_img_width = max(img.shape[1], qr_code.shape[1])
-        new_img = np.ones((new_img_height, new_img_width, 3), dtype=np.uint8) * 255
+        # 2. 自动裁切标签
+        label_img = img[y_lbl:y_lbl + h_lbl, x_lbl:x_lbl + w_lbl]
 
-        # 将原图片和抠出的二维码图片合成到新的白色背景图片上
-        new_img[:img.shape[0], :img.shape[1]] = img
-        new_img[img.shape[0] + 50:img.shape[0] + 50 + qr_code.shape[0], new_img_width - qr_code.shape[1]:] = qr_code
+        # 3. 准备新的白色背景
+        margin = 50
+        orig_h, orig_w = img.shape[:2]
+        tag_h, tag_w = label_img.shape[:2]
+        new_h = orig_h + tag_h + margin * 2
+        new_w = max(orig_w, tag_w) + margin * 2
+        new_img = np.ones((new_h, new_w, 3), dtype=np.uint8) * 255
 
-        # 绘制箭头
-        arrow_start = (x + w // 2, y + h // 2)
-        arrow_end = (new_img_width - qr_code.shape[1] // 2, img.shape[0] + 50 + qr_code.shape[0] // 2)
-        cv2.arrowedLine(new_img, arrow_start, arrow_end, (0, 0, 255), 2)
+        # 4. 拼合图片
+        # 原图放在新背景最上面（左上），铺满
+        new_img[margin:margin + orig_h, margin:margin + orig_w] = img
+        # 标签放在新背景下方，靠右对齐
+        tag_x = new_w - tag_w - margin
+        tag_y = margin + orig_h
+        new_img[tag_y:tag_y + tag_h, tag_x:tag_x + tag_w] = label_img
 
-        # 保存新图片
+        # 5. 生成指示性箭头
+        # 原图标签中心
+        orig_center = (margin + x_lbl + w_lbl // 2, margin + y_lbl + h_lbl // 2)
+        # 新标签中心
+        tag_center = (tag_x + tag_w // 2, tag_y + tag_h // 2)
+        cv2.arrowedLine(new_img, orig_center, tag_center, (0, 0, 255), 4, tipLength=0.15)
+
+        # 6. 保存结果
         cv2.imwrite(output_path, new_img)
-        print(f"二维码处理完成，保存至: {output_path}")
+        print(f"二维码+标签拼图已保存至: {output_path}")
     except Exception as e:
-        print(f"二维码处理失败: {e}")
+        print(f"二维码拼图处理失败: {e}")
 
 
 def preprocess_image(img):
@@ -131,6 +170,23 @@ def process_image(image_path):
     ocr_result = []
     if ocr is not None:
         try:
+            # 添加图片尺寸检查和预处理
+            img = cv2.imread(image_path)
+            max_side = max(img.shape[0], img.shape[1])
+            if max_side > 4000:
+                # 计算缩放比例
+                scale = 4000 / max_side
+                new_width = int(img.shape[1] * scale)
+                new_height = int(img.shape[0] * scale)
+                # 保存原始图片的副本
+                original_img = img.copy()
+                # 缩放图片
+                img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                # 保存缩放后的图片到临时路径
+                temp_path = os.path.join(temp_folder, f"resized_{os.path.basename(image_path)}")
+                cv2.imwrite(temp_path, img)
+                image_path = temp_path  # 使用缩放后的图片路径进行OCR处理
+            
             # 使用新的 predict 方法替代过时的 ocr 方法
             ocr_result = ocr.predict(image_path)
             print(f"文字识别成功: {image_path}")
